@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises'
+import { extname, isAbsolute, relative, resolve } from 'node:path'
 import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { nanoid } from 'nanoid'
@@ -604,7 +606,112 @@ export function buildApp(services: AppServices = createServices()): FastifyInsta
     return services.intelligence.answerQuestion(body.question, contexts)
   })
 
+  registerStaticAssetFallback(app)
+
   return app
+}
+
+type StaticAsset = {
+  body: Buffer
+  cacheControl: string
+  contentType: string
+}
+
+function registerStaticAssetFallback(app: FastifyInstance): void {
+  const staticDirectory = process.env.STATIC_DIR
+  if (!staticDirectory) {
+    return
+  }
+
+  const staticRoot = resolve(staticDirectory)
+
+  app.setNotFoundHandler(async (request, reply) => {
+    const url = new URL(request.url, 'http://chapterlens.local')
+    if (url.pathname.startsWith('/api/')) {
+      return reply.status(404).send({
+        error: {
+          code: 'NOT_FOUND',
+          message: 'This API route was not found.',
+        },
+      } satisfies ApiErrorBody)
+    }
+
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      return reply.status(404).send({
+        error: {
+          code: 'NOT_FOUND',
+          message: 'This route was not found.',
+        },
+      } satisfies ApiErrorBody)
+    }
+
+    const asset = await readStaticAsset(staticRoot, url.pathname)
+    if (!asset) {
+      return reply.status(404).send({
+        error: {
+          code: 'NOT_FOUND',
+          message: 'The static app has not been built.',
+        },
+      } satisfies ApiErrorBody)
+    }
+
+    reply.header('Cache-Control', asset.cacheControl).type(asset.contentType)
+    return request.method === 'HEAD' ? reply.send() : reply.send(asset.body)
+  })
+}
+
+async function readStaticAsset(staticRoot: string, pathname: string): Promise<StaticAsset | null> {
+  const candidatePath = resolveStaticCandidate(staticRoot, pathname)
+  const assetPath = candidatePath && extname(candidatePath) ? candidatePath : resolve(staticRoot, 'index.html')
+  const body = await readFile(assetPath).catch(() => null)
+
+  if (!body) {
+    return null
+  }
+
+  return {
+    body,
+    cacheControl: assetPath.includes('/assets/') ? 'public, max-age=31536000, immutable' : 'no-cache',
+    contentType: getContentType(assetPath),
+  }
+}
+
+function resolveStaticCandidate(staticRoot: string, pathname: string): string | null {
+  let decodedPathname: string
+  try {
+    decodedPathname = decodeURIComponent(pathname)
+  } catch {
+    return null
+  }
+
+  const candidatePath = resolve(staticRoot, decodedPathname.replace(/^\/+/, ''))
+  const relativePath = relative(staticRoot, candidatePath)
+  if (relativePath.startsWith('..') || isAbsolute(relativePath)) {
+    return null
+  }
+
+  return candidatePath
+}
+
+function getContentType(filePath: string): string {
+  switch (extname(filePath)) {
+    case '.css':
+      return 'text/css; charset=utf-8'
+    case '.html':
+      return 'text/html; charset=utf-8'
+    case '.js':
+      return 'text/javascript; charset=utf-8'
+    case '.json':
+      return 'application/json; charset=utf-8'
+    case '.svg':
+      return 'image/svg+xml'
+    case '.txt':
+      return 'text/plain; charset=utf-8'
+    case '.webp':
+      return 'image/webp'
+    default:
+      return 'application/octet-stream'
+  }
 }
 
 type EmbeddingTaskResult = {

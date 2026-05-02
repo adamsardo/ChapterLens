@@ -1,0 +1,43 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "chapterlens",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-05-02",
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "OPENAI_TRANSCRIPTION_MODEL": "gpt-4o-transcribe-diarize",
+    "OPENAI_TEXT_MODEL": "gpt-5.5",
+    "OPENAI_EMBEDDING_MODEL": "text-embedding-3-small",
+    "TRANSCRIPTION_CONCURRENCY": "4",
+    "AUDIO_CHUNK_SECONDS": "300",
+    "AUDIO_BITRATE": "32k",
+    "AUDIO_SAMPLE_RATE": "16000",
+    "CHAPTER_SUMMARIES_ENABLED": "0"
+  },
+  "secrets": {
+    "required": ["OPENAI_API_KEY"]
+  },
+  "containers": [
+    {
+      "class_name": "ChapterLensContainer",
+      "image": "./Dockerfile",
+      "max_instances": 1
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CHAPTERLENS_CONTAINER",
+        "class_name": "ChapterLensContainer"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ChapterLensContainer"]
+    }
+  ]
+}

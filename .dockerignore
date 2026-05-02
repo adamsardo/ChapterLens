@@ -1,0 +1,8 @@
+node_modules
+dist
+.chapterlens-cache
+.env
+.env.*
+.git
+.wrangler
+npm-debug.log*
