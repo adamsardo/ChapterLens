@@ -1,11 +1,11 @@
-FROM --platform=linux/amd64 node:24-bookworm-slim
+ARG TARGETPLATFORM=linux/amd64
+FROM --platform=$TARGETPLATFORM node:24-bookworm-slim
 
 WORKDIR /app
 
 ENV API_HOST=0.0.0.0
 ENV API_PORT=8787
 ENV CHAPTERLENS_CACHE_DIR=/tmp/chapterlens-cache
-ENV NODE_ENV=production
 ENV STATIC_DIR=/app/dist
 
 RUN apt-get update \
@@ -18,6 +18,8 @@ RUN npm ci
 
 COPY . .
 RUN npm run build
+
+ENV NODE_ENV=production
 
 EXPOSE 8787
 
