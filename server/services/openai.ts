@@ -106,6 +106,7 @@ type DiarizedSegment = {
 export type DiarizedTranscription = {
   text?: string
   segments?: DiarizedSegment[]
+  usage?: unknown
 }
 
 export class OpenAIIntelligenceService implements IntelligenceService {
@@ -137,9 +138,9 @@ export class OpenAIIntelligenceService implements IntelligenceService {
   }
 
   async transcribeAudio(audio: AudioTranscriptSource, options: TranscriptionOptions = {}): Promise<TranscriptResult> {
-    const client = this.getClient()
     const chunks = normalizeAudioSource(audio)
     const transcriptionModel = this.defaults.transcriptionModel
+    const createAudioTranscription = (audioPath: string) => this.createAudioTranscription(audioPath, transcriptionModel)
     const transcriptions = new Array<{
       response: DiarizedTranscription
       startSeconds: number
@@ -167,21 +168,12 @@ export class OpenAIIntelligenceService implements IntelligenceService {
 
       const cacheKey = await transcriptionCacheKey(chunk.path, transcriptionModel)
       const cached = await readCachedJson<DiarizedTranscription>('transcriptions', cacheKey)
-      const response =
-        cached ??
-        ((await client.audio.transcriptions.create(
-          {
-            file: createReadStream(chunk.path),
-            model: transcriptionModel,
-            response_format: 'diarized_json',
-            chunking_strategy: 'auto',
-          },
-          { timeout: getOpenAITimeout('OPENAI_TRANSCRIPTION_TIMEOUT_MS', 600_000) },
-        )) as DiarizedTranscription)
+      const usableCached = cached && hasTranscriptionContent(cached) ? cached : null
+      const response = usableCached ?? (await createAudioTranscription(chunk.path))
 
-      if (cached) {
+      if (usableCached) {
         cacheHits += 1
-      } else {
+      } else if (hasTranscriptionContent(response)) {
         await writeCachedJson('transcriptions', cacheKey, response)
       }
 
@@ -201,6 +193,38 @@ export class OpenAIIntelligenceService implements IntelligenceService {
     await Promise.all(Array.from({ length: concurrency }, () => transcribeNext()))
 
     return mergeDiarizedTranscriptions(transcriptions)
+  }
+
+  private async createAudioTranscription(audioPath: string, transcriptionModel: string): Promise<DiarizedTranscription> {
+    const client = this.getClient()
+    const timeout = { timeout: getOpenAITimeout('OPENAI_TRANSCRIPTION_TIMEOUT_MS', 600_000) }
+    const diarized = normalizeTranscriptionResponse(
+      await client.audio.transcriptions.create(
+        {
+          file: createReadStream(audioPath),
+          model: transcriptionModel,
+          response_format: 'diarized_json',
+          chunking_strategy: 'auto',
+        },
+        timeout,
+      ),
+    )
+
+    if (hasTranscriptionContent(diarized)) {
+      return diarized
+    }
+
+    return normalizeTranscriptionResponse(
+      await client.audio.transcriptions.create(
+        {
+          file: createReadStream(audioPath),
+          model: transcriptionModel,
+          response_format: 'json',
+          chunking_strategy: 'auto',
+        },
+        timeout,
+      ),
+    )
   }
 
   async generatePartialInsights(segments: TranscriptSegment[], features: FeatureSet): Promise<InsightResult> {
@@ -404,7 +428,7 @@ export function mergeDiarizedTranscriptions(
     const offset = toFiniteSeconds(chunk.startSeconds)
     const chunkLabel = chunk.index ?? chunkIndex
     const text = chunk.response.text?.trim() ?? ''
-    const rawSegments = chunk.response.segments ?? []
+    const rawSegments = (chunk.response.segments ?? []).filter((segment) => segment.text.trim().length > 0)
 
     if (text) {
       textParts.push(text)
@@ -445,6 +469,60 @@ export function mergeDiarizedTranscriptions(
   return {
     text: textParts.join(' ').trim() || segments.map((segment) => segment.text).join(' '),
     segments,
+  }
+}
+
+export function hasTranscriptionContent(response: DiarizedTranscription): boolean {
+  const text = response.text?.trim() ?? ''
+  const segments = response.segments ?? []
+
+  return text.length > 0 || segments.some((segment) => segment.text.trim().length > 0)
+}
+
+function normalizeTranscriptionResponse(response: unknown): DiarizedTranscription {
+  if (typeof response === 'string') {
+    return { text: response.trim(), segments: [] }
+  }
+
+  if (!response || typeof response !== 'object') {
+    return { text: '', segments: [] }
+  }
+
+  const object = response as { text?: unknown; segments?: unknown; usage?: unknown }
+  const segments = Array.isArray(object.segments)
+    ? object.segments.map(normalizeDiarizedSegment).filter((segment): segment is DiarizedSegment => segment !== null)
+    : []
+
+  return {
+    text: typeof object.text === 'string' ? object.text.trim() : segments.map((segment) => segment.text).join(' '),
+    segments,
+    ...(object.usage ? { usage: object.usage } : {}),
+  }
+}
+
+function normalizeDiarizedSegment(segment: unknown): DiarizedSegment | null {
+  if (!segment || typeof segment !== 'object') {
+    return null
+  }
+
+  const object = segment as {
+    id?: unknown
+    start?: unknown
+    end?: unknown
+    speaker?: unknown
+    text?: unknown
+  }
+
+  if (typeof object.text !== 'string' || object.text.trim().length === 0) {
+    return null
+  }
+
+  return {
+    ...(typeof object.id === 'string' ? { id: object.id } : {}),
+    start: typeof object.start === 'number' ? object.start : 0,
+    end: typeof object.end === 'number' ? object.end : typeof object.start === 'number' ? object.start : 0,
+    ...(typeof object.speaker === 'string' ? { speaker: object.speaker } : {}),
+    text: object.text.trim(),
   }
 }
 

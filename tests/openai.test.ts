@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mergeDiarizedTranscriptions } from '../server/services/openai'
+import { hasTranscriptionContent, mergeDiarizedTranscriptions } from '../server/services/openai'
 
 describe('OpenAI transcription helpers', () => {
   it('offsets chunked transcript segments back onto the full video timeline', () => {
@@ -35,5 +35,40 @@ describe('OpenAI transcription helpers', () => {
         timestamp: '00:20:03',
       }),
     ])
+  })
+
+  it('ignores empty chunks when other chunks contain transcript text', () => {
+    const transcript = mergeDiarizedTranscriptions([
+      {
+        startSeconds: 0,
+        index: 0,
+        response: {
+          text: '',
+          segments: [],
+        },
+      },
+      {
+        startSeconds: 300,
+        index: 1,
+        response: {
+          text: 'The second chunk contains the usable transcript.',
+          segments: [],
+        },
+      },
+    ])
+
+    expect(transcript.text).toBe('The second chunk contains the usable transcript.')
+    expect(transcript.segments).toEqual([
+      expect.objectContaining({
+        startSeconds: 300,
+        timestamp: '00:05:00',
+        text: 'The second chunk contains the usable transcript.',
+      }),
+    ])
+  })
+
+  it('detects empty cached transcription responses as unusable', () => {
+    expect(hasTranscriptionContent({ text: '', segments: [] })).toBe(false)
+    expect(hasTranscriptionContent({ text: '', segments: [{ start: 0, end: 1, text: 'Recovered' }] })).toBe(true)
   })
 })

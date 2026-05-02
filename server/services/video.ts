@@ -1,11 +1,12 @@
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Readable, Writable } from 'node:stream'
 import { execa, type Options } from 'execa'
-import type { DependencyStatus, VideoMetadata } from '../../shared/types'
+import type { DependencyStatus, TranscriptSegment, VideoMetadata } from '../../shared/types'
+import { formatTimestamp, normalizeTranscriptSegments } from '../../shared/time'
 import { ApiError, toErrorMessage } from '../lib/errors'
 import { normalizeYouTubeUrl } from '../lib/youtube'
 
@@ -43,10 +44,16 @@ export type ExtractedAudio = {
   cleanup: () => Promise<void>
 }
 
+export type CaptionTranscript = {
+  text: string
+  segments: TranscriptSegment[]
+}
+
 export type VideoService = {
   checkDependencies: () => Promise<DependencyStatus[]>
   assertDependencies: () => Promise<void>
   getMetadata: (url: string) => Promise<VideoMetadata>
+  getCaptionTranscript: (url: string) => Promise<CaptionTranscript | null>
   extractAudio: (url: string, options?: AudioExtractionOptions) => Promise<ExtractedAudio>
 }
 
@@ -58,6 +65,16 @@ type YtDlpMetadata = {
   duration?: number
   thumbnail?: string
   webpage_url?: string
+}
+
+type Json3CaptionFile = {
+  events?: Array<{
+    tStartMs?: number
+    dDurationMs?: number
+    segs?: Array<{
+      utf8?: string
+    }>
+  }>
 }
 
 export class YtDlpVideoService implements VideoService {
@@ -117,6 +134,48 @@ export class YtDlpVideoService implements VideoService {
       throw new ApiError(502, 'VIDEO_METADATA_FAILED', 'Could not read metadata for this YouTube video.', {
         cause: toErrorMessage(error),
       })
+    }
+  }
+
+  async getCaptionTranscript(inputUrl: string): Promise<CaptionTranscript | null> {
+    const { normalizedUrl } = normalizeYouTubeUrl(inputUrl)
+    const directory = await mkdtemp(join(tmpdir(), 'chapterlens-captions-'))
+
+    try {
+      await this.runner(
+        'yt-dlp',
+        [
+          '--no-playlist',
+          '--skip-download',
+          '--write-subs',
+          '--write-auto-subs',
+          '--sub-langs',
+          getCaptionLanguages(),
+          '--sub-format',
+          'json3',
+          '--output',
+          join(directory, '%(id)s'),
+          normalizedUrl,
+        ],
+        { timeout: 120_000, env: { ...process.env, PATH: TOOL_PATH } },
+      )
+
+      const captionFiles = (await readdir(directory))
+        .filter((file) => /\.json3$/i.test(file))
+        .sort(preferredCaptionOrder)
+
+      for (const file of captionFiles) {
+        const transcript = parseJson3Captions(await readFile(join(directory, file), 'utf8'))
+        if (transcript) {
+          return transcript
+        }
+      }
+
+      return null
+    } catch {
+      return null
+    } finally {
+      await rm(directory, { recursive: true, force: true })
     }
   }
 
@@ -385,6 +444,72 @@ async function emitClosedChunks(
     chunks.push(chunk)
     options.onChunk?.(chunk)
   }
+}
+
+export function parseJson3Captions(raw: string): CaptionTranscript | null {
+  const parsed = JSON.parse(raw) as Json3CaptionFile
+  const segments = normalizeTranscriptSegments(
+    (parsed.events ?? []).flatMap((event, index): TranscriptSegment[] => {
+      const text = cleanCaptionText((event.segs ?? []).map((segment) => segment.utf8 ?? '').join(''))
+      if (!text) {
+        return []
+      }
+
+      const startSeconds = millisecondsToSeconds(event.tStartMs)
+      const durationSeconds = Math.max(0.5, millisecondsToSeconds(event.dDurationMs))
+
+      return [
+        {
+          id: `caption-${index + 1}`,
+          startSeconds,
+          endSeconds: startSeconds + durationSeconds,
+          timestamp: formatTimestamp(startSeconds),
+          text,
+        },
+      ]
+    }),
+  )
+
+  if (segments.length === 0) {
+    return null
+  }
+
+  return {
+    text: segments.map((segment) => segment.text).join(' '),
+    segments,
+  }
+}
+
+function cleanCaptionText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+function millisecondsToSeconds(milliseconds?: number): number {
+  if (!Number.isFinite(milliseconds)) {
+    return 0
+  }
+
+  return Math.max(0, (milliseconds ?? 0) / 1000)
+}
+
+function preferredCaptionOrder(a: string, b: string): number {
+  const score = (file: string) => {
+    if (/\.en-orig\.json3$/i.test(file)) {
+      return 0
+    }
+
+    if (/\.en\.json3$/i.test(file)) {
+      return 1
+    }
+
+    return 2
+  }
+
+  return score(a) - score(b) || a.localeCompare(b)
+}
+
+function getCaptionLanguages(): string {
+  return process.env.YOUTUBE_CAPTION_LANGS ?? 'en-orig,en'
 }
 
 function spawnProcess(file: string, args: string[], options: SpawnOptions = {}): SpawnedProcess {

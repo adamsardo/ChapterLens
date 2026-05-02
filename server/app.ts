@@ -3,6 +3,8 @@ import Fastify, { type FastifyInstance } from 'fastify'
 import { nanoid } from 'nanoid'
 import { z } from 'zod'
 import type {
+  AnalysisListItem,
+  AnalysisRecord,
   AnalyzeJobStartResponse,
   AnalyzeJobStatusResponse,
   AnalyzeResponse,
@@ -16,7 +18,9 @@ import type {
   VideoMetadata,
 } from '../shared/types'
 import { formatTimestamp, normalizeTranscriptSegments } from '../shared/time'
+import { listAnalysisRecords, readAnalysisRecord, toAnalysisListItem, writeAnalysisRecord } from './lib/analysis-library'
 import { buildCacheKey, readCachedJson, writeCachedJson } from './lib/disk-cache'
+import { buildAnalysisExport } from './lib/export'
 import { buildTranscriptChunks, retrieveRelevantChunks, type TranscriptChunk } from './lib/retrieval'
 import { ApiError } from './lib/errors'
 import { normalizeYouTubeUrl } from './lib/youtube'
@@ -49,6 +53,11 @@ const AskRequestSchema = z.object({
   question: z.string().min(1).max(1_000),
 })
 
+const ExportQuerySchema = z.object({
+  preset: z.enum(['summary', 'full-transcript']).default('summary'),
+  format: z.enum(['markdown', 'text']).default('markdown'),
+})
+
 type StoredSession = {
   video: VideoMetadata
   transcriptText: string
@@ -63,6 +72,15 @@ type AnalyzeProgressUpdate = {
   stage: AnalyzeStage
   label: string
   detail?: string
+}
+
+type AnalyzeJobListener = (job: AnalyzeJobStatusResponse) => void
+
+class AnalysisCancelledError extends Error {
+  constructor() {
+    super('Analysis cancelled')
+    this.name = 'AnalysisCancelledError'
+  }
 }
 
 export type AppServices = {
@@ -82,7 +100,10 @@ export function buildApp(services: AppServices = createServices()): FastifyInsta
     logger: false,
   })
   const sessions = new Map<string, StoredSession>()
+  const analysisRecords = new Map<string, AnalysisRecord>()
   const analyzeJobs = new Map<string, AnalyzeJobStatusResponse>()
+  const jobListeners = new Map<string, Set<AnalyzeJobListener>>()
+  const cancelledJobs = new Set<string>()
 
   void app.register(cors, {
     origin: true,
@@ -136,10 +157,18 @@ export function buildApp(services: AppServices = createServices()): FastifyInsta
     const job = createAnalyzeJob(jobId)
     analyzeJobs.set(jobId, job)
 
-    void runAnalyze(body, (progress) => updateAnalyzeJob(job, progress))
+    void runAnalyze(body, (progress) => {
+      throwIfJobCancelled(jobId)
+      updateAnalyzeJob(job, progress)
+      publishAnalyzeJob(jobId, job)
+    })
       .then((result) => {
+        if (cancelledJobs.has(jobId)) {
+          return
+        }
+
         const updatedAt = new Date().toISOString()
-        analyzeJobs.set(jobId, {
+        setAnalyzeJob(jobId, {
           ...job,
           status: 'ready',
           stage: job.stage,
@@ -151,8 +180,19 @@ export function buildApp(services: AppServices = createServices()): FastifyInsta
         })
       })
       .catch((error) => {
+        if (cancelledJobs.has(jobId) || isCancellationError(error)) {
+          setAnalyzeJob(jobId, {
+            ...job,
+            status: 'cancelled',
+            label: 'Analysis cancelled',
+            detail: 'The analysis was stopped before completion',
+            updatedAt: new Date().toISOString(),
+          })
+          return
+        }
+
         const updatedAt = new Date().toISOString()
-        analyzeJobs.set(jobId, {
+        setAnalyzeJob(jobId, {
           ...job,
           status: 'error',
           label: 'Analysis failed',
@@ -176,10 +216,147 @@ export function buildApp(services: AppServices = createServices()): FastifyInsta
     return job
   })
 
+  app.get('/api/analyze/jobs/:jobId/events', async (request, reply) => {
+    const { jobId } = z.object({ jobId: z.string().min(1) }).parse(request.params)
+    const job = analyzeJobs.get(jobId)
+
+    if (!job) {
+      throw new ApiError(404, 'JOB_NOT_FOUND', 'This analysis job was not found.')
+    }
+
+    reply.hijack()
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+    })
+
+    const send = (nextJob: AnalyzeJobStatusResponse) => {
+      reply.raw.write(`data: ${JSON.stringify(nextJob)}\n\n`)
+    }
+    const listeners = jobListeners.get(jobId) ?? new Set<AnalyzeJobListener>()
+    listeners.add(send)
+    jobListeners.set(jobId, listeners)
+    send(job)
+
+    const heartbeat = setInterval(() => {
+      reply.raw.write(': heartbeat\n\n')
+    }, 15_000)
+
+    request.raw.on('close', () => {
+      clearInterval(heartbeat)
+      listeners.delete(send)
+      if (listeners.size === 0) {
+        jobListeners.delete(jobId)
+      }
+    })
+  })
+
+  app.post('/api/analyze/jobs/:jobId/cancel', async (request): Promise<AnalyzeJobStatusResponse> => {
+    const { jobId } = z.object({ jobId: z.string().min(1) }).parse(request.params)
+    const job = analyzeJobs.get(jobId)
+
+    if (!job) {
+      throw new ApiError(404, 'JOB_NOT_FOUND', 'This analysis job was not found.')
+    }
+
+    if (job.status === 'ready' || job.status === 'error' || job.status === 'cancelled') {
+      return job
+    }
+
+    cancelledJobs.add(jobId)
+    return setAnalyzeJob(jobId, {
+      ...job,
+      status: 'cancelled',
+      label: 'Analysis cancelled',
+      detail: 'The analysis was stopped before completion',
+      updatedAt: new Date().toISOString(),
+    })
+  })
+
+  app.get('/api/analyses', async (): Promise<AnalysisListItem[]> => {
+    const records = await mergeAnalysisRecords()
+    return records.map(toAnalysisListItem)
+  })
+
+  app.get('/api/analyses/:sessionId/export', async (request) => {
+    const { sessionId } = z.object({ sessionId: z.string().min(1) }).parse(request.params)
+    const query = ExportQuerySchema.parse(request.query)
+    const record = await getAnalysisRecordOrThrow(sessionId)
+    return buildAnalysisExport(record, query.preset, query.format)
+  })
+
+  app.get('/api/analyses/:sessionId', async (request): Promise<AnalysisRecord> => {
+    const { sessionId } = z.object({ sessionId: z.string().min(1) }).parse(request.params)
+    return getAnalysisRecordOrThrow(sessionId)
+  })
+
   app.post('/api/analyze', async (request): Promise<AnalyzeResponse> => {
     const body = AnalyzeRequestSchema.parse(request.body)
     return runAnalyze(body)
   })
+
+  async function mergeAnalysisRecords(): Promise<AnalysisRecord[]> {
+    const records = new Map<string, AnalysisRecord>()
+
+    for (const record of await listAnalysisRecords(20)) {
+      records.set(record.sessionId, record)
+    }
+
+    for (const record of analysisRecords.values()) {
+      records.set(record.sessionId, record)
+    }
+
+    return [...records.values()]
+      .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+      .slice(0, 12)
+  }
+
+  async function getAnalysisRecordOrThrow(sessionId: string): Promise<AnalysisRecord> {
+    const record = analysisRecords.get(sessionId) ?? (await readAnalysisRecord(sessionId))
+
+    if (!record) {
+      throw new ApiError(404, 'ANALYSIS_NOT_FOUND', 'This analysis was not found in the local library.')
+    }
+
+    analysisRecords.set(sessionId, record)
+    ensureSessionForRecord(record)
+    return record
+  }
+
+  function ensureSessionForRecord(record: AnalysisRecord): void {
+    if (sessions.has(record.sessionId)) {
+      return
+    }
+
+    sessions.set(record.sessionId, {
+      video: record.video,
+      transcriptText: record.transcript.text,
+      segments: record.transcript.segments,
+      chunks: buildTranscriptChunks(record.transcript.segments),
+      embeddings: [],
+      summary: record.summary,
+      chapters: record.chapters,
+    })
+  }
+
+  function setAnalyzeJob(jobId: string, job: AnalyzeJobStatusResponse): AnalyzeJobStatusResponse {
+    analyzeJobs.set(jobId, job)
+    publishAnalyzeJob(jobId, job)
+    return job
+  }
+
+  function publishAnalyzeJob(jobId: string, job: AnalyzeJobStatusResponse): void {
+    for (const listener of jobListeners.get(jobId) ?? []) {
+      listener(job)
+    }
+  }
+
+  function throwIfJobCancelled(jobId: string): void {
+    if (cancelledJobs.has(jobId)) {
+      throw new AnalysisCancelledError()
+    }
+  }
 
   async function runAnalyze(body: AnalyzeRequestBody, onProgress?: (progress: AnalyzeProgressUpdate) => void) {
     const features = normalizeFeatures(body.features)
@@ -216,6 +393,23 @@ export function buildApp(services: AppServices = createServices()): FastifyInsta
         detail: `${cachedTranscript.segments.length} transcript segments restored from local cache`,
       })
       return finishAnalysis(video, cachedTranscript, features, onProgress)
+    }
+
+    onProgress?.({
+      stage: 'transcribing',
+      label: 'Checking YouTube captions',
+      detail: 'Looking for timestamped captions before falling back to audio transcription',
+    })
+    const captionTranscript = await services.video.getCaptionTranscript(normalizedUrl)
+
+    if (captionTranscript) {
+      await writeCachedJson('video-transcripts', featuresCacheKey, captionTranscript)
+      onProgress?.({
+        stage: 'embedding',
+        label: 'Using YouTube captions',
+        detail: `${captionTranscript.segments.length} caption segments restored from YouTube`,
+      })
+      return finishAnalysis(video, captionTranscript, features, onProgress)
     }
 
     onProgress?.({
@@ -304,18 +498,8 @@ export function buildApp(services: AppServices = createServices()): FastifyInsta
 
     const [{ chunks, embeddings }, insights] = await Promise.all([embeddingsPromise, insightsPromise])
     const sessionId = nanoid()
-
-    sessions.set(sessionId, {
-      video,
-      transcriptText: transcript.text,
-      segments: transcript.segments,
-      chunks,
-      embeddings,
-      summary: insights.summary,
-      chapters: insights.chapters,
-    })
-
-    return {
+    const now = new Date().toISOString()
+    const response: AnalyzeResponse = {
       sessionId,
       video,
       transcript: {
@@ -326,6 +510,26 @@ export function buildApp(services: AppServices = createServices()): FastifyInsta
       ...(insights.chapters ? { chapters: insights.chapters } : {}),
       qaReady: features.qa,
     }
+    const record: AnalysisRecord = {
+      ...response,
+      createdAt: now,
+      updatedAt: now,
+      features,
+    }
+
+    sessions.set(sessionId, {
+      video,
+      transcriptText: transcript.text,
+      segments: transcript.segments,
+      chunks,
+      embeddings,
+      summary: insights.summary,
+      chapters: insights.chapters,
+    })
+    analysisRecords.set(sessionId, record)
+    await writeAnalysisRecord(record)
+
+    return response
   }
 
   async function buildEmbeddingsForChunks(chunks: TranscriptChunk[]) {
@@ -372,7 +576,13 @@ export function buildApp(services: AppServices = createServices()): FastifyInsta
 
   app.post('/api/ask', async (request): Promise<AskResponse> => {
     const body = AskRequestSchema.parse(request.body)
-    const session = sessions.get(body.sessionId)
+    let session = sessions.get(body.sessionId)
+
+    if (!session) {
+      const record = await getAnalysisRecordOrThrow(body.sessionId)
+      ensureSessionForRecord(record)
+      session = sessions.get(body.sessionId)
+    }
 
     if (!session) {
       throw new ApiError(404, 'SESSION_NOT_FOUND', 'Analyze a video before asking questions about it.')
@@ -625,6 +835,10 @@ function normalizeFeatures(features?: Partial<FeatureSet>): FeatureSet {
     chapters: features?.chapters ?? DEFAULT_FEATURES.chapters,
     qa: features?.qa ?? DEFAULT_FEATURES.qa,
   }
+}
+
+function isCancellationError(error: unknown): boolean {
+  return error instanceof AnalysisCancelledError
 }
 
 function toErrorBody(error: unknown): ApiErrorBody['error'] {

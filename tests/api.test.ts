@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { ApiError } from '../server/lib/errors'
 import { buildApp, type AppServices } from '../server/app'
@@ -37,6 +40,7 @@ function createFakeServices(overrides: Partial<AppServices> = {}): AppServices {
         durationSeconds: 30,
         webpageUrl: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
       }),
+      getCaptionTranscript: async () => null,
       extractAudio: async (_url, options) => {
         const chunks = [{ path: '/tmp/chunks/chunk-000.mp3', startSeconds: 0, index: 0 }]
         chunks.forEach((chunk) => options?.onChunk?.(chunk))
@@ -92,6 +96,7 @@ function createFakeServices(overrides: Partial<AppServices> = {}): AppServices {
 
 describe('api routes', () => {
   const originalCacheDisabled = process.env.CHAPTERLENS_CACHE_DISABLED
+  const originalCacheDir = process.env.CHAPTERLENS_CACHE_DIR
 
   beforeEach(() => {
     process.env.CHAPTERLENS_CACHE_DISABLED = '1'
@@ -102,6 +107,12 @@ describe('api routes', () => {
       delete process.env.CHAPTERLENS_CACHE_DISABLED
     } else {
       process.env.CHAPTERLENS_CACHE_DISABLED = originalCacheDisabled
+    }
+
+    if (originalCacheDir === undefined) {
+      delete process.env.CHAPTERLENS_CACHE_DIR
+    } else {
+      process.env.CHAPTERLENS_CACHE_DIR = originalCacheDir
     }
   })
 
@@ -124,6 +135,44 @@ describe('api routes', () => {
       summary: expect.any(String),
       qaReady: true,
     })
+
+    await app.close()
+  })
+
+  it('uses YouTube captions before audio transcription when captions are available', async () => {
+    const events: string[] = []
+    const app = buildApp(
+      createFakeServices({
+        video: {
+          ...createFakeServices().video,
+          getCaptionTranscript: async () => {
+            events.push('captions')
+            return {
+              text: transcriptSegments.map((segment) => segment.text).join(' '),
+              segments: transcriptSegments,
+            }
+          },
+          extractAudio: async () => {
+            events.push('audio')
+            throw new Error('audio should not run when captions exist')
+          },
+        },
+      }),
+    )
+    await app.ready()
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/analyze',
+      payload: {
+        url: 'https://youtu.be/dQw4w9WgXcQ',
+        features: { summary: true, chapters: true, qa: true },
+      },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json().transcript.segments).toHaveLength(2)
+    expect(events).toEqual(['captions'])
 
     await app.close()
   })
@@ -317,6 +366,138 @@ describe('api routes', () => {
     expect(events).toContain('embed')
     expect(events).toContain('partial-insight')
     expect(events).toContain('reduce-insight')
+
+    await app.close()
+  })
+
+  it('persists analyses, reloads them, answers from the library, and exports presets', async () => {
+    const cacheDir = await mkdtemp(join(tmpdir(), 'chapterlens-api-'))
+    delete process.env.CHAPTERLENS_CACHE_DISABLED
+    process.env.CHAPTERLENS_CACHE_DIR = cacheDir
+
+    try {
+      const app = buildApp(createFakeServices())
+      await app.ready()
+
+      const analyze = await app.inject({
+        method: 'POST',
+        url: '/api/analyze',
+        payload: {
+          url: 'https://youtu.be/dQw4w9WgXcQ',
+          features: { summary: true, chapters: true, qa: true },
+        },
+      })
+      const { sessionId } = analyze.json()
+
+      const library = await app.inject({ method: 'GET', url: '/api/analyses' })
+      expect(library.statusCode).toBe(200)
+      expect(library.json()[0]).toMatchObject({
+        sessionId,
+        chapterCount: 1,
+        transcriptSegmentCount: 2,
+      })
+
+      await app.close()
+
+      const restoredApp = buildApp(createFakeServices())
+      await restoredApp.ready()
+
+      const record = await restoredApp.inject({
+        method: 'GET',
+        url: `/api/analyses/${sessionId}`,
+      })
+      expect(record.statusCode).toBe(200)
+      expect(record.json()).toMatchObject({
+        sessionId,
+        video: { title: 'Transcript Intelligence Demo' },
+        transcript: { segments: expect.any(Array) },
+      })
+
+      const answer = await restoredApp.inject({
+        method: 'POST',
+        url: '/api/ask',
+        payload: { sessionId, question: 'What does the speaker explain?' },
+      })
+      expect(answer.statusCode).toBe(200)
+      expect(answer.json().citations[0].text).toContain('transcript based Q&A')
+
+      const summaryExport = await restoredApp.inject({
+        method: 'GET',
+        url: `/api/analyses/${sessionId}/export?preset=summary&format=markdown`,
+      })
+      expect(summaryExport.statusCode).toBe(200)
+      expect(summaryExport.json()).toMatchObject({
+        filename: expect.stringMatching(/summary\.md$/),
+        mimeType: 'text/markdown; charset=utf-8',
+      })
+      expect(summaryExport.json().content).toContain('## Summary')
+      expect(summaryExport.json().content).not.toContain('## Transcript')
+
+      const transcriptExport = await restoredApp.inject({
+        method: 'GET',
+        url: `/api/analyses/${sessionId}/export?preset=full-transcript&format=text`,
+      })
+      expect(transcriptExport.statusCode).toBe(200)
+      expect(transcriptExport.json().filename).toMatch(/full-transcript\.txt$/)
+      expect(transcriptExport.json().content).toContain('TRANSCRIPT')
+      expect(transcriptExport.json().content).toContain('[00:00:12]')
+
+      await restoredApp.close()
+    } finally {
+      await rm(cacheDir, { recursive: true, force: true })
+    }
+  })
+
+  it('cancels a running analysis job and keeps it cancelled', async () => {
+    let releaseMetadata: (() => void) | undefined
+    const metadataGate = new Promise<void>((resolve) => {
+      releaseMetadata = resolve
+    })
+    const app = buildApp(
+      createFakeServices({
+        video: {
+          ...createFakeServices().video,
+          getMetadata: async () => {
+            await metadataGate
+            return {
+              id: 'dQw4w9WgXcQ',
+              title: 'Transcript Intelligence Demo',
+              channel: 'ChapterLens',
+              durationSeconds: 30,
+              webpageUrl: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+            }
+          },
+        },
+      }),
+    )
+    await app.ready()
+
+    const start = await app.inject({
+      method: 'POST',
+      url: '/api/analyze/jobs',
+      payload: { url: 'https://youtu.be/dQw4w9WgXcQ' },
+    })
+    const { jobId } = start.json()
+
+    const cancel = await app.inject({
+      method: 'POST',
+      url: `/api/analyze/jobs/${jobId}/cancel`,
+    })
+
+    expect(cancel.statusCode).toBe(200)
+    expect(cancel.json()).toMatchObject({
+      status: 'cancelled',
+      label: 'Analysis cancelled',
+    })
+
+    releaseMetadata?.()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    const job = await app.inject({
+      method: 'GET',
+      url: `/api/analyze/jobs/${jobId}`,
+    })
+    expect(job.json().status).toBe('cancelled')
 
     await app.close()
   })

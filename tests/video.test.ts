@@ -2,7 +2,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { PassThrough, Writable } from 'node:stream'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { YtDlpVideoService } from '../server/services/video'
+import { parseJson3Captions, YtDlpVideoService } from '../server/services/video'
 
 describe('video service', () => {
   const originalChunkSeconds = process.env.AUDIO_CHUNK_SECONDS
@@ -120,5 +120,44 @@ describe('video service', () => {
     } finally {
       await audio.cleanup()
     }
+  })
+
+  it('parses YouTube json3 captions into transcript segments', () => {
+    const transcript = parseJson3Captions(
+      JSON.stringify({
+        events: [
+          { tStartMs: 0, dDurationMs: 1000 },
+          {
+            tStartMs: 320,
+            dDurationMs: 5920,
+            segs: [{ utf8: 'Jason,' }, { utf8: ' do' }, { utf8: ' you' }],
+          },
+          {
+            tStartMs: 2149,
+            dDurationMs: 4091,
+            segs: [{ utf8: '\n' }],
+          },
+          {
+            tStartMs: 6240,
+            dDurationMs: 5920,
+            segs: [{ utf8: 'My feed' }, { utf8: ' is now' }],
+          },
+        ],
+      }),
+    )
+
+    expect(transcript?.text).toBe('Jason, do you My feed is now')
+    expect(transcript?.segments).toEqual([
+      expect.objectContaining({
+        id: 'caption-2',
+        timestamp: '00:00:00',
+        text: 'Jason, do you',
+      }),
+      expect.objectContaining({
+        id: 'caption-4',
+        timestamp: '00:00:06',
+        text: 'My feed is now',
+      }),
+    ])
   })
 })

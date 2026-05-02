@@ -58,6 +58,33 @@ export type AnalyzeResponse = {
   qaReady: boolean
 }
 
+export type AnalysisRecord = AnalyzeResponse & {
+  createdAt: string
+  updatedAt: string
+  features: FeatureSet
+}
+
+export type AnalysisListItem = {
+  sessionId: string
+  video: VideoMetadata
+  createdAt: string
+  updatedAt: string
+  summaryPreview?: string
+  chapterCount: number
+  transcriptSegmentCount: number
+  qaReady: boolean
+}
+
+export type ExportFormat = 'markdown' | 'text'
+
+export type ExportPreset = 'summary' | 'full-transcript'
+
+export type ExportResponse = {
+  filename: string
+  mimeType: string
+  content: string
+}
+
 export type AskRequest = {
   sessionId: string
   question: string
@@ -85,7 +112,7 @@ export type AnalyzeJobStartResponse = {
 
 export type AnalyzeJobStatusResponse = {
   jobId: string
-  status: 'queued' | 'running' | 'ready' | 'error'
+  status: 'queued' | 'running' | 'ready' | 'error' | 'cancelled'
   stage: AnalyzeStage
   label: string
   detail?: string

@@ -1,23 +1,34 @@
-import { type FormEvent, type ReactNode, useEffect, useMemo, useState } from 'react'
+import { type FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
+import type {
+  AnalysisListItem,
+  AnalysisRecord,
+  AnalyzeJobStatusResponse,
+  AnalyzeRequest,
+  AnalyzeResponse,
+  AnalyzeStage,
+  AskResponse,
+  Citation,
+  ExportFormat,
+  ExportPreset,
+  FeatureSet,
+  HealthResponse,
+  TranscriptSegment,
+} from '../shared/types'
+import { parseTimestamp } from '../shared/time'
 import {
-  AlertTriangle,
-  ArrowRight,
-  BookOpen,
-  Check,
-  Clock3,
-  FileText,
-  HelpCircle,
-  Loader2,
-  MessageSquareText,
-  Play,
-  Search,
-  Sparkles,
-} from 'lucide-react'
-import type { AnalyzeJobStatusResponse, AnalyzeResponse, AnalyzeStage, AskResponse, FeatureSet, HealthResponse } from '../shared/types'
-import { ApiClientError, askVideoQuestion, getAnalyzeJob, getHealth, startAnalyzeJob } from './lib/api'
+  ApiClientError,
+  askVideoQuestion,
+  cancelAnalyzeJob,
+  exportAnalysis,
+  getAnalysisRecord,
+  getHealth,
+  listAnalyses,
+  startAnalyzeJob,
+  subscribeAnalyzeJob,
+} from './lib/api'
 import './App.css'
 
-type AnalyzeStatus = 'idle' | 'loading' | 'ready' | 'error'
+type AnalyzeStatus = 'idle' | 'loading' | 'ready' | 'error' | 'cancelled'
 
 type QaTurn = {
   id: string
@@ -41,18 +52,162 @@ const progressSteps: Array<{ stage: AnalyzeStage; label: string }> = [
   { stage: 'insights', label: 'Analyze' },
 ]
 
+type IconName =
+  | 'alert'
+  | 'arrow-right'
+  | 'book'
+  | 'check'
+  | 'clock'
+  | 'download'
+  | 'file'
+  | 'help'
+  | 'library'
+  | 'loader'
+  | 'message'
+  | 'play'
+  | 'reset'
+  | 'search'
+  | 'spark'
+  | 'stop'
+
+function Icon({ name, size = 16, className = '', filled = false }: { name: IconName; size?: number; className?: string; filled?: boolean }) {
+  const paths: Record<IconName, ReactNode> = {
+    alert: (
+      <>
+        <path d="M12 4.2 3.5 19h17L12 4.2Z" />
+        <path d="M12 9v4.5" />
+        <path d="M12 16.8h.01" />
+      </>
+    ),
+    'arrow-right': (
+      <>
+        <path d="M5 12h14" />
+        <path d="m13 6 6 6-6 6" />
+      </>
+    ),
+    book: (
+      <>
+        <path d="M5.5 5.5h7A3.5 3.5 0 0 1 16 9v10.5h-7A3.5 3.5 0 0 0 5.5 23V5.5Z" />
+        <path d="M16 9a3.5 3.5 0 0 1 3.5-3.5h-1A3.5 3.5 0 0 0 15 9v10.5" />
+      </>
+    ),
+    check: <path d="m5 12.5 4 4L19.5 6" />,
+    clock: (
+      <>
+        <circle cx="12" cy="12" r="8" />
+        <path d="M12 7.5v5l3.5 2" />
+      </>
+    ),
+    download: (
+      <>
+        <path d="M12 4v10" />
+        <path d="m7.5 10 4.5 4.5L16.5 10" />
+        <path d="M5 19.5h14" />
+      </>
+    ),
+    file: (
+      <>
+        <path d="M7 4.5h7l3.5 3.5v11.5H7V4.5Z" />
+        <path d="M14 4.5V8h3.5" />
+        <path d="M9.5 12h5" />
+        <path d="M9.5 15.5h4" />
+      </>
+    ),
+    help: (
+      <>
+        <circle cx="12" cy="12" r="8" />
+        <path d="M9.6 9.4A2.6 2.6 0 1 1 12 13v1" />
+        <path d="M12 17.4h.01" />
+      </>
+    ),
+    library: (
+      <>
+        <path d="M5 6h3v13H5V6Z" />
+        <path d="M10.5 5h3v14h-3V5Z" />
+        <path d="m16 6 3 1v12l-3-1V6Z" />
+      </>
+    ),
+    loader: (
+      <>
+        <path d="M12 4v3" />
+        <path d="M12 17v3" />
+        <path d="M4 12h3" />
+        <path d="M17 12h3" />
+        <path d="m6.3 6.3 2.1 2.1" />
+        <path d="m15.6 15.6 2.1 2.1" />
+      </>
+    ),
+    message: (
+      <>
+        <path d="M5 6.5h14v10H9l-4 3v-13Z" />
+        <path d="M8.5 10h7" />
+        <path d="M8.5 13h4.5" />
+      </>
+    ),
+    play: filled ? <path d="M8 5.5v13l11-6.5L8 5.5Z" /> : <path d="M8 5.5v13l11-6.5L8 5.5Z" />,
+    reset: (
+      <>
+        <path d="M6.2 9A6.5 6.5 0 1 1 5.8 15" />
+        <path d="M6 5.5V9h3.5" />
+      </>
+    ),
+    search: (
+      <>
+        <circle cx="10.5" cy="10.5" r="5.5" />
+        <path d="m15 15 4 4" />
+      </>
+    ),
+    spark: (
+      <>
+        <path d="M12 4.5 13.7 10l5.3 2-5.3 2L12 19.5 10.3 14 5 12l5.3-2L12 4.5Z" />
+        <path d="M18.5 4.5v3" />
+        <path d="M17 6h3" />
+      </>
+    ),
+    stop: <path d="M7 7h10v10H7V7Z" />,
+  }
+
+  return (
+    <svg
+      aria-hidden="true"
+      className={className}
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill={filled ? 'currentColor' : 'none'}
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth="2.2"
+    >
+      {paths[name]}
+    </svg>
+  )
+}
+
 function App() {
   const [url, setUrl] = useState('')
   const [features, setFeatures] = useState<FeatureSet>(defaultFeatures)
   const [status, setStatus] = useState<AnalyzeStatus>('idle')
   const [analysisProgress, setAnalysisProgress] = useState<AnalyzeJobStatusResponse | null>(null)
+  const [currentJobId, setCurrentJobId] = useState<string | null>(null)
+  const [lastAnalyzeRequest, setLastAnalyzeRequest] = useState<AnalyzeRequest | null>(null)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
   const [analysis, setAnalysis] = useState<AnalyzeResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [health, setHealth] = useState<HealthResponse | null>(null)
+  const [recentAnalyses, setRecentAnalyses] = useState<AnalysisListItem[]>([])
+  const [libraryLoading, setLibraryLoading] = useState(false)
+  const [transcriptQuery, setTranscriptQuery] = useState('')
+  const [activeTranscriptId, setActiveTranscriptId] = useState<string | null>(null)
   const [question, setQuestion] = useState('')
   const [qaTurns, setQaTurns] = useState<QaTurn[]>([])
   const [qaLoading, setQaLoading] = useState(false)
+  const [exportPreset, setExportPreset] = useState<ExportPreset>('summary')
+  const [exportFormat, setExportFormat] = useState<ExportFormat>('markdown')
+  const [exportLoading, setExportLoading] = useState(false)
+  const [cancelLoading, setCancelLoading] = useState(false)
+  const unsubscribeJobRef = useRef<(() => void) | null>(null)
 
   const selectedFeatureCount = Object.values(features).filter(Boolean).length
   const canAnalyze = url.trim().length > 0 && selectedFeatureCount > 0 && status !== 'loading'
@@ -61,12 +216,69 @@ function App() {
     return analysis?.summary?.trim().split(/\s+/).filter(Boolean).length ?? 0
   }, [analysis?.summary])
 
+  const filteredTranscriptSegments = useMemo(() => {
+    const segments = analysis?.transcript.segments ?? []
+    const query = transcriptQuery.trim().toLowerCase()
+
+    if (!query) {
+      return segments
+    }
+
+    return segments.filter((segment) => {
+      return (
+        segment.text.toLowerCase().includes(query) ||
+        segment.timestamp.includes(query) ||
+        segment.speaker?.toLowerCase().includes(query)
+      )
+    })
+  }, [analysis?.transcript.segments, transcriptQuery])
+
+  useEffect(() => {
+    const revealItems = Array.from(document.querySelectorAll<HTMLElement>('.reveal'))
+
+    if (!('IntersectionObserver' in window)) {
+      revealItems.forEach((item) => item.classList.add('is-visible'))
+      return
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            entry.target.classList.add('is-visible')
+            observer.unobserve(entry.target)
+          }
+        })
+      },
+      { threshold: 0.12 },
+    )
+
+    revealItems.forEach((item) => observer.observe(item))
+
+    return () => observer.disconnect()
+  }, [analysis?.sessionId, qaTurns.length, status])
+
   useEffect(() => {
     void getHealth()
       .then(setHealth)
       .catch(() => {
         setHealth(null)
       })
+    setLibraryLoading(true)
+    void listAnalyses()
+      .then(setRecentAnalyses)
+      .catch(() => {
+        setRecentAnalyses([])
+      })
+      .finally(() => {
+        setLibraryLoading(false)
+      })
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      unsubscribeJobRef.current?.()
+    }
   }, [])
 
   useEffect(() => {
@@ -85,48 +297,171 @@ function App() {
 
   async function handleAnalyze(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    await beginAnalysis({ url, features })
+  }
+
+  async function beginAnalysis(request: AnalyzeRequest) {
     setStatus('loading')
     setError(null)
     setAnalysis(null)
     setAnalysisProgress(null)
+    setCurrentJobId(null)
+    setCancelLoading(false)
+    setTranscriptQuery('')
+    setActiveTranscriptId(null)
     setQaTurns([])
+    setLastAnalyzeRequest(request)
+    unsubscribeJobRef.current?.()
 
     try {
-      const { jobId } = await startAnalyzeJob({
-        url,
-        features,
-      })
+      const { jobId } = await startAnalyzeJob(request)
+      setCurrentJobId(jobId)
+      unsubscribeJobRef.current = subscribeAnalyzeJob(
+        jobId,
+        (job) => {
+          setAnalysisProgress(job)
 
-      for (;;) {
-        const job = await getAnalyzeJob(jobId)
-        setAnalysisProgress(job)
+          if (job.status === 'ready') {
+            if (!job.result) {
+              setStatus('error')
+              setError('Analysis finished but no result was returned.')
+              return
+            }
 
-        if (job.status === 'ready') {
-          if (!job.result) {
-            throw new ApiClientError(
-              'INCOMPLETE_JOB',
-              'Analysis finished but no result was returned.',
-              { jobId },
-            )
+            setAnalysis(job.result)
+            setStatus('ready')
+            setCurrentJobId(null)
+            setCancelLoading(false)
+            unsubscribeJobRef.current?.()
+            unsubscribeJobRef.current = null
+            void refreshLibrary()
+            return
           }
-          setAnalysis(job.result)
-          setStatus('ready')
-          return
-        }
 
-        if (job.status === 'error') {
-          if (job.error) {
-            throw new ApiClientError(job.error.code, job.error.message, job.error.details)
+          if (job.status === 'error') {
+            setStatus('error')
+            setError(job.error?.message ?? 'Analysis failed without an error payload.')
+            setCurrentJobId(null)
+            setCancelLoading(false)
+            unsubscribeJobRef.current?.()
+            unsubscribeJobRef.current = null
+            return
           }
-          throw new ApiClientError('ANALYSIS_FAILED', 'Analysis failed without an error payload.')
-        }
 
-        await sleep(1200)
+          if (job.status === 'cancelled') {
+            setStatus('cancelled')
+            setCurrentJobId(null)
+            setCancelLoading(false)
+            unsubscribeJobRef.current?.()
+            unsubscribeJobRef.current = null
+          }
+        },
+        () => {
+          setStatus('error')
+          setError('Lost the live progress connection. Retry the analysis to continue.')
+          setCurrentJobId(null)
+          setCancelLoading(false)
+        },
+      )
+    } catch (caught) {
+      setStatus('error')
+      setError(toDisplayError(caught))
+      setCurrentJobId(null)
+      setCancelLoading(false)
+    }
+  }
+
+  async function handleCancelAnalysis() {
+    if (!currentJobId) {
+      return
+    }
+
+    setCancelLoading(true)
+    try {
+      const job = await cancelAnalyzeJob(currentJobId)
+      setAnalysisProgress(job)
+      if (job.status === 'cancelled') {
+        setStatus('cancelled')
+        setCurrentJobId(null)
       }
+    } catch (caught) {
+      setError(toDisplayError(caught))
+    } finally {
+      setCancelLoading(false)
+    }
+  }
+
+  async function handleRetryAnalysis() {
+    await beginAnalysis(lastAnalyzeRequest ?? { url, features })
+  }
+
+  async function refreshLibrary() {
+    setLibraryLoading(true)
+    try {
+      setRecentAnalyses(await listAnalyses())
+    } catch {
+      setRecentAnalyses([])
+    } finally {
+      setLibraryLoading(false)
+    }
+  }
+
+  async function handleLoadAnalysis(sessionId: string) {
+    setError(null)
+    setQaTurns([])
+    setTranscriptQuery('')
+    setActiveTranscriptId(null)
+    unsubscribeJobRef.current?.()
+
+    try {
+      const record: AnalysisRecord = await getAnalysisRecord(sessionId)
+      setAnalysis(record)
+      setUrl(record.video.webpageUrl)
+      setFeatures(record.features)
+      setStatus('ready')
     } catch (caught) {
       setStatus('error')
       setError(toDisplayError(caught))
     }
+  }
+
+  async function handleExport() {
+    if (!analysis?.sessionId) {
+      return
+    }
+
+    setExportLoading(true)
+    try {
+      const exported = await exportAnalysis(analysis.sessionId, {
+        preset: exportPreset,
+        format: exportFormat,
+      })
+      downloadText(exported.filename, exported.mimeType, exported.content)
+    } catch (caught) {
+      setError(toDisplayError(caught))
+    } finally {
+      setExportLoading(false)
+    }
+  }
+
+  function jumpToTranscript(startSeconds: number) {
+    const segments = analysis?.transcript.segments ?? []
+    const target =
+      segments.find((segment) => startSeconds >= segment.startSeconds && startSeconds <= segment.endSeconds) ??
+      segments.find((segment) => segment.startSeconds >= startSeconds) ??
+      segments[0]
+
+    if (!target) {
+      return
+    }
+
+    setActiveTranscriptId(target.id)
+    window.requestAnimationFrame(() => {
+      document.getElementById(transcriptDomId(target.id))?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center',
+      })
+    })
   }
 
   async function handleAsk(event: FormEvent<HTMLFormElement>) {
@@ -165,11 +500,11 @@ function App() {
 
   return (
     <main className="app-shell">
-      <section className="command-surface" aria-labelledby="app-title">
+      <section className="command-surface reveal" aria-labelledby="app-title">
         <header className="topbar">
           <div className="brand">
             <span className="brand-mark" aria-hidden="true">
-              <Play size={16} fill="currentColor" />
+              <Icon name="play" size={16} filled />
             </span>
             <div>
               <h1 id="app-title">ChapterLens</h1>
@@ -181,17 +516,19 @@ function App() {
 
         <form className="url-form" onSubmit={handleAnalyze}>
           <label className="url-input-wrap">
-            <Search size={20} aria-hidden="true" />
+            <Icon name="search" size={20} />
             <span className="sr-only">YouTube video URL</span>
             <input
               value={url}
               onChange={(event) => setUrl(event.target.value)}
               placeholder="Paste a YouTube URL"
               autoComplete="url"
+              inputMode="url"
+              spellCheck={false}
             />
           </label>
           <button className="primary-button" type="submit" disabled={!canAnalyze}>
-            {status === 'loading' ? <Loader2 className="spin" size={18} /> : <Sparkles size={18} />}
+            {status === 'loading' ? <Icon name="loader" className="spin" size={18} /> : <Icon name="spark" size={18} />}
             Analyze
           </button>
         </form>
@@ -199,47 +536,76 @@ function App() {
         <div className="feature-row" aria-label="Outputs to generate">
           <FeatureToggle
             active={features.summary}
-            icon={<FileText size={16} />}
+            icon={<Icon name="file" size={16} />}
             label="Summary"
             onClick={() => toggleFeature('summary')}
           />
           <FeatureToggle
             active={features.chapters}
-            icon={<BookOpen size={16} />}
+            icon={<Icon name="book" size={16} />}
             label="Chapters"
             onClick={() => toggleFeature('chapters')}
           />
           <FeatureToggle
             active={features.qa}
-            icon={<MessageSquareText size={16} />}
+            icon={<Icon name="message" size={16} />}
             label="Q&A"
             onClick={() => toggleFeature('qa')}
           />
         </div>
 
-        {status === 'loading' && <ProgressStrip progress={analysisProgress} elapsedSeconds={elapsedSeconds} />}
-        {error && <ErrorNotice message={error} />}
+        <RecentAnalyses
+          activeSessionId={analysis?.sessionId}
+          analyses={recentAnalyses}
+          loading={libraryLoading}
+          onLoad={handleLoadAnalysis}
+        />
+
+        {status === 'loading' && (
+          <ProgressStrip
+            progress={analysisProgress}
+            elapsedSeconds={elapsedSeconds}
+            cancelLoading={cancelLoading}
+            onCancel={handleCancelAnalysis}
+          />
+        )}
+        {status === 'cancelled' && <CancelledNotice onRetry={handleRetryAnalysis} />}
+        {error && <ErrorNotice message={error} onRetry={handleRetryAnalysis} />}
         {health && !health.ok && <SetupNotice health={health} />}
       </section>
 
-      <section className="workspace" aria-live="polite">
+      <section className="workspace reveal" aria-live="polite">
         <div className="insights-column">
           {analysis ? (
             <>
-              <VideoHeader analysis={analysis} />
+              <VideoHeader
+                analysis={analysis}
+                exportPreset={exportPreset}
+                exportFormat={exportFormat}
+                exportLoading={exportLoading}
+                onExport={handleExport}
+                onExportPresetChange={setExportPreset}
+                onExportFormatChange={setExportFormat}
+              />
               {analysis.summary && (
-                <section className="panel">
-                  <PanelTitle icon={<FileText size={18} />} title="Summary" meta={`${wordCount} words`} />
+                <section className="panel reveal">
+                  <PanelTitle icon={<Icon name="file" size={18} />} title="Summary" meta={`${wordCount} words`} />
                   <p className="summary-text">{analysis.summary}</p>
                 </section>
               )}
               {analysis.chapters && analysis.chapters.length > 0 && (
-                <section className="panel">
-                  <PanelTitle icon={<BookOpen size={18} />} title="Chapters" meta={`${analysis.chapters.length} sections`} />
+                <section className="panel reveal">
+                  <PanelTitle icon={<Icon name="book" size={18} />} title="Chapters" meta={`${analysis.chapters.length} sections`} />
                   <ol className="chapter-list">
                     {analysis.chapters.map((chapter) => (
                       <li key={`${chapter.timestamp}-${chapter.title}`}>
-                        <time>{chapter.timestamp}</time>
+                        <button
+                          type="button"
+                          aria-label={`Jump to transcript at ${chapter.timestamp}`}
+                          onClick={() => jumpToTranscript(parseTimestamp(chapter.timestamp))}
+                        >
+                          <time>{chapter.timestamp}</time>
+                        </button>
                         <div>
                           <h3>{chapter.title}</h3>
                           {chapter.summary && <p>{chapter.summary}</p>}
@@ -249,25 +615,33 @@ function App() {
                   </ol>
                 </section>
               )}
+              <TranscriptPanel
+                activeTranscriptId={activeTranscriptId}
+                query={transcriptQuery}
+                segments={filteredTranscriptSegments}
+                totalSegments={analysis.transcript.segments.length}
+                onQueryChange={setTranscriptQuery}
+                onSelectSegment={(segment) => jumpToTranscript(segment.startSeconds)}
+              />
             </>
           ) : (
             <EmptyState />
           )}
         </div>
 
-        <aside className="qa-column" aria-label="Video Q&A">
+        <aside className="qa-column reveal" aria-label="Video Q&A">
           <div className="qa-header">
-            <PanelTitle icon={<HelpCircle size={18} />} title="Q&A" meta={analysis?.qaReady ? 'Ready' : 'Waiting'} />
+            <PanelTitle icon={<Icon name="help" size={18} />} title="Q&A" meta={analysis?.qaReady ? 'Ready' : 'Waiting'} />
           </div>
 
           <div className="qa-thread">
             {qaTurns.length === 0 ? (
               <div className="qa-empty">
-                <MessageSquareText size={26} aria-hidden="true" />
+                <Icon name="message" size={26} />
                 <p>Ask about claims, definitions, examples, or moments in the video.</p>
               </div>
             ) : (
-              qaTurns.map((turn) => <QaTurnView key={turn.id} turn={turn} />)
+              qaTurns.map((turn) => <QaTurnView key={turn.id} turn={turn} onSelectCitation={jumpToTranscript} />)
             )}
           </div>
 
@@ -279,10 +653,15 @@ function App() {
                 onChange={(event) => setQuestion(event.target.value)}
                 placeholder={analysis?.qaReady ? 'Ask a precise question' : 'Analyze with Q&A enabled'}
                 disabled={!analysis?.qaReady || qaLoading}
+                enterKeyHint="send"
               />
             </label>
-            <button type="submit" disabled={!analysis?.qaReady || !question.trim() || qaLoading}>
-              {qaLoading ? <Loader2 className="spin" size={17} /> : <ArrowRight size={17} />}
+            <button
+              type="submit"
+              aria-label="Ask question"
+              disabled={!analysis?.qaReady || !question.trim() || qaLoading}
+            >
+              {qaLoading ? <Icon name="loader" className="spin" size={17} /> : <Icon name="arrow-right" size={17} />}
             </button>
           </form>
         </aside>
@@ -306,8 +685,58 @@ function FeatureToggle({
     <button className={`feature-toggle ${active ? 'is-active' : ''}`} type="button" aria-pressed={active} onClick={onClick}>
       {icon}
       <span>{label}</span>
-      {active && <Check size={14} aria-hidden="true" />}
+      {active && <Icon name="check" size={14} />}
     </button>
+  )
+}
+
+function RecentAnalyses({
+  activeSessionId,
+  analyses,
+  loading,
+  onLoad,
+}: {
+  activeSessionId?: string
+  analyses: AnalysisListItem[]
+  loading: boolean
+  onLoad: (sessionId: string) => void
+}) {
+  if (loading && analyses.length === 0) {
+    return (
+      <div className="recent-analyses is-loading">
+        <Icon name="library" size={15} />
+        Loading local library
+      </div>
+    )
+  }
+
+  if (analyses.length === 0) {
+    return null
+  }
+
+  return (
+    <section className="recent-analyses" aria-label="Recent analyses">
+      <div className="recent-title">
+        <Icon name="library" size={15} />
+        <span>Recent</span>
+      </div>
+      <div className="recent-list">
+        {analyses.slice(0, 4).map((item) => (
+          <button
+            className={item.sessionId === activeSessionId ? 'is-active' : ''}
+            key={item.sessionId}
+            type="button"
+            aria-current={item.sessionId === activeSessionId ? 'true' : undefined}
+            onClick={() => onLoad(item.sessionId)}
+          >
+            <strong>{item.video.title}</strong>
+            <span>
+              {item.chapterCount} chapters - {item.transcriptSegmentCount} segments
+            </span>
+          </button>
+        ))}
+      </div>
+    </section>
   )
 }
 
@@ -318,7 +747,7 @@ function HealthBadge({ health }: { health: HealthResponse | null }) {
 
   return (
     <span className={`health-badge ${health.ok ? 'is-ok' : 'is-warn'}`}>
-      {health.ok ? <Check size={14} /> : <AlertTriangle size={14} />}
+      {health.ok ? <Icon name="check" size={14} /> : <Icon name="alert" size={14} />}
       {health.ok ? 'API ready' : 'Setup needed'}
     </span>
   )
@@ -327,9 +756,13 @@ function HealthBadge({ health }: { health: HealthResponse | null }) {
 function ProgressStrip({
   progress,
   elapsedSeconds,
+  cancelLoading,
+  onCancel,
 }: {
   progress: AnalyzeJobStatusResponse | null
   elapsedSeconds: number
+  cancelLoading: boolean
+  onCancel: () => void
 }) {
   const activeIndex = progress?.activeStep ?? 0
 
@@ -343,7 +776,7 @@ function ProgressStrip({
 
           return (
             <div className={isActive ? 'is-active' : ''} key={step.stage}>
-              <span>{stepNumber < activeIndex ? <Check size={13} /> : isCurrent ? <Loader2 className="spin" size={13} /> : stepNumber}</span>
+              <span>{stepNumber < activeIndex ? <Icon name="check" size={13} /> : isCurrent ? <Icon name="loader" className="spin" size={13} /> : stepNumber}</span>
               {step.label}
             </div>
           )
@@ -354,17 +787,44 @@ function ProgressStrip({
           <strong>{progress?.label ?? 'Starting analysis'}</strong>
           {progress?.detail && <p>{progress.detail}</p>}
         </div>
-        <time>{formatElapsed(elapsedSeconds)}</time>
+        <div className="progress-actions">
+          <time>{formatElapsed(elapsedSeconds)}</time>
+          <button type="button" onClick={onCancel} disabled={cancelLoading}>
+            {cancelLoading ? <Icon name="loader" className="spin" size={14} /> : <Icon name="stop" size={14} />}
+            Stop
+          </button>
+        </div>
       </div>
     </div>
   )
 }
 
-function ErrorNotice({ message }: { message: string }) {
+function ErrorNotice({ message, onRetry }: { message: string; onRetry: () => void }) {
   return (
     <div className="notice is-error" role="alert">
-      <AlertTriangle size={18} />
-      <p>{message}</p>
+      <Icon name="alert" size={18} />
+      <div>
+        <p>{message}</p>
+        <button type="button" onClick={onRetry}>
+          <Icon name="reset" size={14} />
+          Retry analysis
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function CancelledNotice({ onRetry }: { onRetry: () => void }) {
+  return (
+    <div className="notice is-cancelled" role="status">
+      <Icon name="stop" size={18} />
+      <div>
+        <p>Analysis cancelled.</p>
+        <button type="button" onClick={onRetry}>
+          <Icon name="reset" size={14} />
+          Retry analysis
+        </button>
+      </div>
     </div>
   )
 }
@@ -374,7 +834,7 @@ function SetupNotice({ health }: { health: HealthResponse }) {
 
   return (
     <div className="notice is-setup">
-      <AlertTriangle size={18} />
+      <Icon name="alert" size={18} />
       <div>
         <p>Missing setup: {missing.map((dependency) => dependency.name).join(', ')}</p>
         <span>Install local video tools and set OPENAI_API_KEY to run real analysis.</span>
@@ -383,19 +843,55 @@ function SetupNotice({ health }: { health: HealthResponse }) {
   )
 }
 
-function VideoHeader({ analysis }: { analysis: AnalyzeResponse }) {
+function VideoHeader({
+  analysis,
+  exportPreset,
+  exportFormat,
+  exportLoading,
+  onExport,
+  onExportPresetChange,
+  onExportFormatChange,
+}: {
+  analysis: AnalyzeResponse
+  exportPreset: ExportPreset
+  exportFormat: ExportFormat
+  exportLoading: boolean
+  onExport: () => void
+  onExportPresetChange: (preset: ExportPreset) => void
+  onExportFormatChange: (format: ExportFormat) => void
+}) {
   return (
-    <section className="video-header">
+    <section className="video-header reveal">
       {analysis.video.thumbnailUrl ? <img src={analysis.video.thumbnailUrl} alt="" /> : <div className="thumbnail-fallback" />}
       <div>
         <p className="video-channel">{analysis.video.channel ?? 'YouTube video'}</p>
         <h2>{analysis.video.title}</h2>
         <div className="video-meta">
           <span>
-            <Clock3 size={14} />
+            <Icon name="clock" size={14} />
             {formatDuration(analysis.video.durationSeconds)}
           </span>
           <span>{analysis.transcript.segments.length} transcript segments</span>
+        </div>
+        <div className="export-row" aria-label="Export analysis">
+          <label>
+            <span className="sr-only">Export preset</span>
+            <select value={exportPreset} onChange={(event) => onExportPresetChange(event.target.value as ExportPreset)}>
+              <option value="summary">Summary</option>
+              <option value="full-transcript">Full transcript</option>
+            </select>
+          </label>
+          <label>
+            <span className="sr-only">Export format</span>
+            <select value={exportFormat} onChange={(event) => onExportFormatChange(event.target.value as ExportFormat)}>
+              <option value="markdown">Markdown</option>
+              <option value="text">Text</option>
+            </select>
+          </label>
+          <button type="button" onClick={onExport} disabled={exportLoading}>
+            {exportLoading ? <Icon name="loader" className="spin" size={15} /> : <Icon name="download" size={15} />}
+            Export
+          </button>
         </div>
       </div>
     </section>
@@ -414,11 +910,97 @@ function PanelTitle({ icon, title, meta }: { icon: ReactNode; title: string; met
   )
 }
 
+function TranscriptPanel({
+  activeTranscriptId,
+  query,
+  segments,
+  totalSegments,
+  onQueryChange,
+  onSelectSegment,
+}: {
+  activeTranscriptId: string | null
+  query: string
+  segments: TranscriptSegment[]
+  totalSegments: number
+  onQueryChange: (query: string) => void
+  onSelectSegment: (segment: TranscriptSegment) => void
+}) {
+  const resultMeta = query.trim() ? `${segments.length} of ${totalSegments} matches` : `${totalSegments} segments`
+
+  return (
+    <section className="panel transcript-panel reveal">
+      <PanelTitle icon={<Icon name="file" size={18} />} title="Transcript" meta={resultMeta} />
+      <label className="transcript-search">
+        <Icon name="search" size={17} />
+        <span className="sr-only">Search transcript</span>
+        <input
+          value={query}
+          onChange={(event) => onQueryChange(event.target.value)}
+          placeholder="Search transcript, timestamp, or speaker"
+          type="search"
+          enterKeyHint="search"
+        />
+      </label>
+      <ol className="transcript-list">
+        {segments.length === 0 ? (
+          <li className="transcript-empty">No transcript segments match this search.</li>
+        ) : (
+          segments.map((segment) => (
+            <li className={segment.id === activeTranscriptId ? 'is-active' : ''} id={transcriptDomId(segment.id)} key={segment.id}>
+              <button
+                type="button"
+                aria-label={`Jump to transcript at ${segment.timestamp}`}
+                onClick={() => onSelectSegment(segment)}
+              >
+                <time>{segment.timestamp}</time>
+              </button>
+              <p>
+                {segment.speaker && <strong>{segment.speaker}: </strong>}
+                <HighlightedText query={query} text={segment.text} />
+              </p>
+            </li>
+          ))
+        )}
+      </ol>
+    </section>
+  )
+}
+
+function HighlightedText({ text, query }: { text: string; query: string }) {
+  const trimmedQuery = query.trim()
+
+  if (!trimmedQuery) {
+    return text
+  }
+
+  const lowerText = text.toLowerCase()
+  const lowerQuery = trimmedQuery.toLowerCase()
+  const parts: ReactNode[] = []
+  let cursor = 0
+  let matchIndex = lowerText.indexOf(lowerQuery)
+
+  while (matchIndex !== -1) {
+    if (matchIndex > cursor) {
+      parts.push(text.slice(cursor, matchIndex))
+    }
+
+    parts.push(<mark key={`${matchIndex}-${lowerQuery}`}>{text.slice(matchIndex, matchIndex + trimmedQuery.length)}</mark>)
+    cursor = matchIndex + trimmedQuery.length
+    matchIndex = lowerText.indexOf(lowerQuery, cursor)
+  }
+
+  if (cursor < text.length) {
+    parts.push(text.slice(cursor))
+  }
+
+  return <>{parts}</>
+}
+
 function EmptyState() {
   return (
-    <section className="empty-panel">
+    <section className="empty-panel reveal">
       <div className="empty-orbit">
-        <Play size={22} fill="currentColor" />
+        <Icon name="play" size={22} filled />
       </div>
       <h2>Paste a video to begin.</h2>
       <p>
@@ -429,19 +1011,19 @@ function EmptyState() {
   )
 }
 
-function QaTurnView({ turn }: { turn: QaTurn }) {
+function QaTurnView({ turn, onSelectCitation }: { turn: QaTurn; onSelectCitation: (startSeconds: number) => void }) {
   return (
     <article className="qa-turn">
       <p className="question">{turn.question}</p>
       {turn.error && (
         <div className="qa-error">
-          <AlertTriangle size={16} />
+          <Icon name="alert" size={16} />
           {turn.error}
         </div>
       )}
       {!turn.response && !turn.error && (
         <div className="qa-pending">
-          <Loader2 className="spin" size={16} />
+          <Icon name="loader" className="spin" size={16} />
           Searching transcript context
         </div>
       )}
@@ -450,9 +1032,13 @@ function QaTurnView({ turn }: { turn: QaTurn }) {
           <section>
             <h3>Reasoning</h3>
             <p>{turn.response.reasoning}</p>
-            <div className="citation-row">
+            <div className="citation-list">
               {turn.response.citations.map((citation) => (
-                <span key={`${citation.timestamp}-${citation.text.slice(0, 20)}`}>{citation.timestamp}</span>
+                <CitationButton
+                  citation={citation}
+                  key={`${citation.timestamp}-${citation.text.slice(0, 20)}`}
+                  onSelectCitation={onSelectCitation}
+                />
               ))}
             </div>
           </section>
@@ -463,6 +1049,26 @@ function QaTurnView({ turn }: { turn: QaTurn }) {
         </div>
       )}
     </article>
+  )
+}
+
+function CitationButton({
+  citation,
+  onSelectCitation,
+}: {
+  citation: Citation
+  onSelectCitation: (startSeconds: number) => void
+}) {
+  return (
+    <button
+      className="citation-card"
+      type="button"
+      aria-label={`Open citation at ${citation.timestamp}`}
+      onClick={() => onSelectCitation(citation.startSeconds)}
+    >
+      <span>{citation.timestamp}</span>
+      <p>{citation.text}</p>
+    </button>
   )
 }
 
@@ -482,8 +1088,21 @@ function formatElapsed(seconds: number): string {
   return `${minutes}:${String(remainder).padStart(2, '0')}`
 }
 
-function sleep(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, milliseconds))
+function transcriptDomId(segmentId: string): string {
+  return `transcript-segment-${segmentId.replace(/[^a-zA-Z0-9_-]/g, '-')}`
+}
+
+function downloadText(filename: string, mimeType: string, content: string): void {
+  const blob = new Blob([content], { type: mimeType })
+  const href = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+
+  anchor.href = href
+  anchor.download = filename
+  document.body.append(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(href)
 }
 
 function toDisplayError(error: unknown): string {

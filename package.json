@@ -19,7 +19,6 @@
     "dotenv": "^17.4.2",
     "execa": "^9.6.1",
     "fastify": "^5.8.5",
-    "lucide-react": "^1.14.0",
     "nanoid": "^5.1.11",
     "openai": "^6.35.0",
     "react": "^19.2.5",
