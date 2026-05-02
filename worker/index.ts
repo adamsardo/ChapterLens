@@ -2,7 +2,7 @@ import { Container, getContainer } from '@cloudflare/containers'
 
 interface Env {
   CHAPTERLENS_CONTAINER: DurableObjectNamespace<ChapterLensContainer>
-  OPENAI_API_KEY: string
+  OPENAI_API_KEY?: string
   OPENAI_TRANSCRIPTION_MODEL: string
   OPENAI_TEXT_MODEL: string
   OPENAI_EMBEDDING_MODEL: string
@@ -22,7 +22,7 @@ export class ChapterLensContainer extends Container<Env> {
     API_PORT: '8787',
     CHAPTERLENS_CACHE_DIR: '/tmp/chapterlens-cache',
     NODE_ENV: 'production',
-    OPENAI_API_KEY: this.env.OPENAI_API_KEY,
+    OPENAI_API_KEY: this.env.OPENAI_API_KEY ?? '',
     OPENAI_TRANSCRIPTION_MODEL: this.env.OPENAI_TRANSCRIPTION_MODEL,
     OPENAI_TEXT_MODEL: this.env.OPENAI_TEXT_MODEL,
     OPENAI_EMBEDDING_MODEL: this.env.OPENAI_EMBEDDING_MODEL,
